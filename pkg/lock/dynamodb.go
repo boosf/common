@@ -2,13 +2,13 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/boosf/common/internal/option"
 	"github.com/boosf/common/pkg/clock"
 	"github.com/google/uuid"
 )
@@ -40,8 +40,22 @@ type dynamoClient struct {
 	ttlKeyName       string
 }
 
-func (d *dynamoClient) Acquire(ctx context.Context, key string, duration time.Duration, options ...option.Option[*lockOption]) (Lock, error) {
-	finalOptions := option.ApplyOptions(newDefaultOption(), options)
+func (d *dynamoClient) Acquire(ctx context.Context, key string, duration time.Duration, options ...lockOption) (Lock, error) {
+	config := newLockConfig()
+	for _, option := range options {
+		config = option.Apply(config)
+	}
+	errs := []error{}
+	for attempt := range config.Retries {
+		lock, err := d.acquire(ctx, key, duration)
+		if err != nil {
+			errs = append(errs, err)
+			config.RetryStrategy.WaitFor(attempt)
+			continue
+		}
+		return lock, nil
+	}
+	return nil, fmt.Errorf("failed to acquire lock, key=%s, err=%w", key, errors.Join(errs...))
 }
 
 func (d *dynamoClient) acquire(ctx context.Context, key string, duration time.Duration) (Lock, error) {
