@@ -41,6 +41,10 @@ type dynamoClient struct {
 }
 
 func (d *dynamoClient) Acquire(ctx context.Context, key string, duration time.Duration, options ...option.Option[*lockOption]) (Lock, error) {
+	finalOptions := option.ApplyOptions(newDefaultOption(), options)
+}
+
+func (d *dynamoClient) acquire(ctx context.Context, key string, duration time.Duration) (Lock, error) {
 	ttl := d.expiresAt(duration)
 	id := uuid.New().String()
 	_, err := d.dynamodbClient.PutItem(ctx, &dynamodb.PutItemInput{
