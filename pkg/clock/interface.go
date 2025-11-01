@@ -1,5 +1,5 @@
 package clock
 
-type Clock interface {
+type Client interface {
 	Now() int64
 }

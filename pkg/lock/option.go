@@ -7,44 +7,44 @@ import (
 	"github.com/boosf/common/internal/retrystrategy"
 )
 
-func NewRetriesOption(retries int64) option.Option[*Option] {
-	return &retriesOption{
+func NewRetriesOption(retries int64) option.Option[*lockOption] {
+	return &retriesLockOption{
 		retries: retries,
 	}
 }
 
-func NewRetryStrategyOption(retryStrategy retrystrategy.RetryStrategy) option.Option[*Option] {
-	return &retryStrategyOption{
+func NewRetryStrategyOption(retryStrategy retrystrategy.RetryStrategy) option.Option[*lockOption] {
+	return &retryStrategyLockOption{
 		retryStrategy: retryStrategy,
 	}
 }
 
-func newDefaultOption() *Option {
-	return &Option{
+func newDefaultOption() *lockOption {
+	return &lockOption{
 		Retries:       3,
 		RetryStrategy: retrystrategy.NewExponentialBackoffWithJitterRetryStrategy(100*time.Millisecond, 3*time.Second),
 	}
 }
 
-type Option struct {
+type lockOption struct {
 	Retries       int64
 	RetryStrategy retrystrategy.RetryStrategy
 }
 
-type retriesOption struct {
+type retriesLockOption struct {
 	retries int64
 }
 
-func (r *retriesOption) Apply(option *Option) *Option {
+func (r *retriesLockOption) Apply(option *lockOption) *lockOption {
 	option.Retries = r.retries
 	return option
 }
 
-type retryStrategyOption struct {
+type retryStrategyLockOption struct {
 	retryStrategy retrystrategy.RetryStrategy
 }
 
-func (r *retryStrategyOption) Apply(option *Option) *Option {
+func (r *retryStrategyLockOption) Apply(option *lockOption) *lockOption {
 	option.RetryStrategy = r.retryStrategy
 	return option
 }

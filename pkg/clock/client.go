@@ -2,13 +2,13 @@ package clock
 
 import "time"
 
-func New() Clock {
-	return &clock{}
+func New() Client {
+	return &client{}
 }
 
-type clock struct {
+type client struct {
 }
 
-func (c *clock) Now() int64 {
+func (c *client) Now() int64 {
 	return time.Now().Unix()
 }
