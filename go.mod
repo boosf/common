@@ -7,7 +7,6 @@ toolchain go1.24.9
 require (
 	github.com/aws/aws-sdk-go-v2 v1.39.5
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.52.3
-	github.com/google/uuid v1.6.0
 )
 
 require (
