@@ -4,17 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/boosf/common/pkg/clock"
-)
-
-const (
-	defaultSequenceID = "0"
 )
 
 func NewDynamoClient(
@@ -50,6 +45,12 @@ type dynamoClient struct {
 	ttlKeyName       string
 }
 
+type lockExpiry struct {
+	now       string
+	expiresAt string
+	ttl       string
+}
+
 func (d *dynamoClient) Acquire(ctx context.Context, key string, duration time.Duration, options ...lockOption) (Lock, error) {
 	config := newLockConfig()
 	for _, option := range options {
@@ -69,69 +70,53 @@ func (d *dynamoClient) Acquire(ctx context.Context, key string, duration time.Du
 }
 
 func (d *dynamoClient) acquire(ctx context.Context, key string, duration time.Duration) (Lock, error) {
-	id, err := d.getSequenceID(ctx, key)
+	input := d.buildAcquireInput(key, duration)
+	out, err := d.dynamodbClient.UpdateItem(ctx, input)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get sequence id, err=%w", err)
+		return nil, fmt.Errorf("failed to update item, err=%w", err)
 	}
-	now := d.clockClient.Now()
-	expiresAt := now + int64(duration.Seconds())
-	ttl := now + int64(d.expiry.Seconds())
-	_, err = d.dynamodbClient.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(d.table),
-		Item: map[string]types.AttributeValue{
-			d.partitionKeyName: &types.AttributeValueMemberS{Value: key},
-			d.idKeyName:        &types.AttributeValueMemberN{Value: id},
-			d.expiresAtKeyName: &types.AttributeValueMemberN{Value: fmt.Sprint(expiresAt)},
-			d.ttlKeyName:       &types.AttributeValueMemberN{Value: fmt.Sprint(ttl)},
-		},
-		ConditionExpression: aws.String("attribute_not_exists(#pk) or (#id = :id - 1 and #expires < :now)"),
-		ExpressionAttributeNames: map[string]string{
-			"#pk":      d.partitionKeyName,
-			"#id":      d.idKeyName,
-			"#expires": d.expiresAtKeyName,
-		},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":id":  &types.AttributeValueMemberN{Value: id},
-			":now": &types.AttributeValueMemberN{Value: fmt.Sprint(now)},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to put item, err=%w", err)
+	idAttr, ok := out.Attributes[d.idKeyName].(*types.AttributeValueMemberN)
+	if !ok {
+		return nil, errors.New("missing or invalid id")
 	}
-	return &dynamoLock{dynamoClient: d, key: key, id: id}, nil
+	return &dynamoLock{dynamoClient: d, key: key, id: idAttr.Value}, nil
 }
 
-func (d *dynamoClient) getSequenceID(ctx context.Context, key string) (string, error) {
-	item, err := d.dynamodbClient.GetItem(ctx, &dynamodb.GetItemInput{
+func (d *dynamoClient) buildAcquireInput(key string, duration time.Duration) *dynamodb.UpdateItemInput {
+	lockExpiry := d.getLockExpiry(duration)
+	return &dynamodb.UpdateItemInput{
 		TableName: aws.String(d.table),
 		Key: map[string]types.AttributeValue{
 			d.partitionKeyName: &types.AttributeValueMemberS{Value: key},
 		},
-		ProjectionExpression: aws.String("#id"),
+		ConditionExpression: aws.String("attribute_not_exists(#pk) OR #expires < :now"),
+		UpdateExpression:    aws.String("SET #id = if_not_exists(#id, :zero) + :one, #expires = :expires, #ttl = :ttl"),
 		ExpressionAttributeNames: map[string]string{
-			"#id": d.idKeyName,
+			"#pk":      d.partitionKeyName,
+			"#id":      d.idKeyName,
+			"#expires": d.expiresAtKeyName,
+			"#ttl":     d.ttlKeyName,
 		},
-		ConsistentRead: aws.Bool(true),
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to get item, err=%w", err)
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":zero":    &types.AttributeValueMemberN{Value: "0"},
+			":one":     &types.AttributeValueMemberN{Value: "1"},
+			":expires": &types.AttributeValueMemberN{Value: lockExpiry.expiresAt},
+			":ttl":     &types.AttributeValueMemberN{Value: lockExpiry.ttl},
+			":now":     &types.AttributeValueMemberN{Value: lockExpiry.now},
+		},
+		ReturnValues: types.ReturnValueUpdatedNew,
 	}
-	if item.Item == nil {
-		return defaultSequenceID, nil
+}
+
+func (d *dynamoClient) getLockExpiry(duration time.Duration) *lockExpiry {
+	now := d.clockClient.Now()
+	expiresAt := now + int64(duration.Seconds())
+	ttl := now + int64(d.expiry.Seconds())
+	return &lockExpiry{
+		now:       fmt.Sprint(now),
+		expiresAt: fmt.Sprint(expiresAt),
+		ttl:       fmt.Sprint(ttl),
 	}
-	attributes, ok := item.Item[d.idKeyName]
-	if !ok {
-		return "", errors.New("id is missing from item")
-	}
-	currIDStr, ok := attributes.(*types.AttributeValueMemberN)
-	if !ok {
-		return "", errors.New("id is not type number")
-	}
-	currID, err := strconv.ParseInt(currIDStr.Value, 10, 64)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse id, err=%w", err)
-	}
-	return fmt.Sprint(currID + 1), nil
 }
 
 type dynamoLock struct {
@@ -142,36 +127,63 @@ type dynamoLock struct {
 
 func (d *dynamoLock) Extend(ctx context.Context, duration time.Duration) error {
 	dynamoClient := d.dynamoClient
-	ttl := dynamoClient.expiresAt(duration)
-	_, err := dynamoClient.dynamodbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName: aws.String(dynamoClient.table),
-		Key: map[string]types.AttributeValue{
-			dynamoClient.partitionKeyName: &types.AttributeValueMemberS{Value: d.key},
-		},
-		UpdateExpression:          aws.String("SET #ttl = :ttl"),
-		ConditionExpression:       aws.String("#id = :id"),
-		ExpressionAttributeNames:  map[string]string{"#ttl": dynamoClient.ttlKeyName, "#id": dynamoClient.idKeyName},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":ttl": &types.AttributeValueMemberN{Value: ttl}, ":id": &types.AttributeValueMemberS{Value: d.id}},
-	})
+	input := d.buildExtendInput(duration)
+	_, err := dynamoClient.dynamodbClient.UpdateItem(ctx, input)
 	if err != nil {
 		return fmt.Errorf("failed to update key, key=%s, err=%w", d.key, err)
 	}
 	return nil
 }
 
-func (d *dynamoLock) Release(ctx context.Context) error {
+func (d *dynamoLock) buildExtendInput(duration time.Duration) *dynamodb.UpdateItemInput {
 	dynamoClient := d.dynamoClient
-	_, err := dynamoClient.dynamodbClient.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+	lockExpiry := dynamoClient.getLockExpiry(duration)
+	return &dynamodb.UpdateItemInput{
 		TableName: aws.String(dynamoClient.table),
 		Key: map[string]types.AttributeValue{
 			dynamoClient.partitionKeyName: &types.AttributeValueMemberS{Value: d.key},
 		},
-		ConditionExpression:       aws.String("#id = :id"),
-		ExpressionAttributeNames:  map[string]string{"#id": dynamoClient.idKeyName},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":id": &types.AttributeValueMemberS{Value: d.id}},
-	})
+		ConditionExpression: aws.String("#id = :id"),
+		UpdateExpression:    aws.String("SET #ttl = :ttl, #expiry = :expiry"),
+		ExpressionAttributeNames: map[string]string{
+			"#id":     dynamoClient.idKeyName,
+			"#ttl":    dynamoClient.ttlKeyName,
+			"#expiry": dynamoClient.expiresAtKeyName,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":id":     &types.AttributeValueMemberN{Value: d.id},
+			":ttl":    &types.AttributeValueMemberN{Value: lockExpiry.ttl},
+			":expiry": &types.AttributeValueMemberS{Value: lockExpiry.expiresAt},
+		},
+	}
+}
+
+func (d *dynamoLock) Release(ctx context.Context) error {
+	dynamoClient := d.dynamoClient
+	input := d.buildReleaseInput()
+	_, err := dynamoClient.dynamodbClient.UpdateItem(ctx, input)
 	if err != nil {
 		return fmt.Errorf("failed to delete key, key=%s, err=%w", d.key, err)
 	}
 	return nil
+}
+
+func (d *dynamoLock) buildReleaseInput() *dynamodb.UpdateItemInput {
+	dynamoClient := d.dynamoClient
+	return &dynamodb.UpdateItemInput{
+		TableName: aws.String(dynamoClient.table),
+		Key: map[string]types.AttributeValue{
+			dynamoClient.partitionKeyName: &types.AttributeValueMemberS{Value: d.key},
+		},
+		ConditionExpression: aws.String("#id = :id"),
+		UpdateExpression:    aws.String("SET #expiry = :expiry"),
+		ExpressionAttributeNames: map[string]string{
+			"#id":     dynamoClient.idKeyName,
+			"#expiry": dynamoClient.expiresAtKeyName,
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":id":     &types.AttributeValueMemberN{Value: d.id},
+			":expiry": &types.AttributeValueMemberS{Value: "0"},
+		},
+	}
 }
