@@ -10,16 +10,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-type S3Client struct {
+type s3Client struct {
 	s3     *s3.Client
 	bucket string
 }
 
 func NewS3Client(s3c *s3.Client, bucket string) Client {
-	return &S3Client{s3: s3c, bucket: bucket}
+	return &s3Client{
+		s3:     s3c,
+		bucket: bucket,
+	}
 }
 
-func (s *S3Client) Get(ctx context.Context, key string) (string, error) {
+func (s *s3Client) Get(ctx context.Context, key string) (string, error) {
 	out, err := s.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -35,7 +38,7 @@ func (s *S3Client) Get(ctx context.Context, key string) (string, error) {
 	return string(b), nil
 }
 
-func (s *S3Client) Put(ctx context.Context, key string, value string) error {
+func (s *s3Client) Put(ctx context.Context, key string, value string) error {
 	b := []byte(value)
 	_, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
