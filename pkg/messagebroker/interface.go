@@ -8,8 +8,8 @@ type Producer interface {
 
 type MessageHandler interface {
 	Handle(ctx context.Context, message *Message) error
-	SaveCheckpoint(ctx context.Context, checkpointKey string) error
-	LoadCheckpoint(ctx context.Context, checkpointKey string) error
+	SaveCheckpoint(ctx context.Context, checkpoint *CheckpointMetadata) error
+	LoadCheckpoint(ctx context.Context, checkpoint *CheckpointMetadata) error
 }
 
 type Consumer interface {
