@@ -17,7 +17,14 @@ const (
 	lockDuration = 10 * time.Second
 )
 
-func newKinesisShardManager(kinesisClient *kinesis.Client, lockClient lock.Client, kvstoreClient kvstore.Client, appID string, nodeID string, streamName string) *kinesisShardManager {
+func newKinesisShardManager(
+	kinesisClient *kinesis.Client,
+	lockClient lock.Client,
+	kvstoreClient kvstore.Client,
+	appID string,
+	nodeID string,
+	streamName string,
+) *kinesisShardManager {
 	return &kinesisShardManager{
 		kinesisClient: kinesisClient,
 		lockClient:    lockClient,
@@ -25,7 +32,6 @@ func newKinesisShardManager(kinesisClient *kinesis.Client, lockClient lock.Clien
 		appID:         appID,
 		nodeID:        nodeID,
 		streamName:    streamName,
-		activeShards:  map[string]context.CancelFunc{},
 	}
 }
 
@@ -36,7 +42,6 @@ type kinesisShardManager struct {
 	appID         string
 	nodeID        string
 	streamName    string
-	activeShards  map[string]context.CancelFunc
 }
 
 type shardConfiguration struct {
@@ -44,18 +49,20 @@ type shardConfiguration struct {
 	active          []string
 }
 
-func (k *kinesisShardManager) GetShardConfiguration(ctx context.Context) (*shardConfiguration, error) {
+func (k *kinesisShardManager) AcquireShards(ctx context.Context) (*shardConfiguration, error) {
+	// **** Here we will start the lock, lookup the consistent hash ring, find what active shards we should own and then hold them
+	// **** Once we have our active shards, each worker will start their active shards, resolve their dependencies to get their current states (i.e. replay the old streams if necessary), then read from the horizon (or the stored offset)
+	shards, err := k.getShards(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get shards")
+	}
+	shardConfiguration := k.buildShardConfiguration(shards)
 	lockKey := k.getLockKey()
 	lock, err := k.lockClient.Acquire(ctx, lockKey, lockDuration)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get lock, err=%w", err)
 	}
 	defer lock.Release(ctx)
-	shards, err := k.getShards(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get shards")
-	}
-	shardConfiguration := k.buildShardConfiguration(shards)
 	return shardConfiguration, nil
 }
 
