@@ -9,6 +9,6 @@ func New() Client {
 type client struct {
 }
 
-func (c *client) Now() int64 {
+func (c *client) UnixNow() int64 {
 	return time.Now().Unix()
 }

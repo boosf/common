@@ -109,7 +109,7 @@ func (d *dynamoClient) buildAcquireInput(key string, duration time.Duration) *dy
 }
 
 func (d *dynamoClient) getLockExpiry(duration time.Duration) *lockExpiry {
-	now := d.clockClient.Now()
+	now := d.clockClient.UnixNow()
 	expiresAt := now + int64(duration.Seconds())
 	ttl := now + int64(d.expiry.Seconds())
 	return &lockExpiry{
