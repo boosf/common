@@ -45,6 +45,8 @@ func newKinesisShardManager(
 		hashRingExpiry:          hashRingExpiry,
 		hashRingPartitionExpiry: hashRingPartitionExpiry,
 		leaseDuration:           leaseDuration,
+
+		leasedShards: map[string]lock.Lock{},
 	}
 }
 
@@ -60,32 +62,40 @@ type kinesisShardManager struct {
 	hashRingExpiry          time.Duration
 	hashRingPartitionExpiry time.Duration
 	leaseDuration           time.Duration
+
+	leasedShards map[string]lock.Lock
 }
 
 type shardConfiguration struct {
 	dependencyGraph map[string][]string
-	active          []string
 	shards          map[string]*types.Shard
+	active          []string
 }
 
 func (k *kinesisShardManager) AcquireShards(ctx context.Context) (*shardConfiguration, error) {
-	// **** Here we will start the lock, lookup the consistent hash ring, find what active shards we should own and then hold them
-	// **** Once we have our active shards, each worker will start their active shards, resolve their dependencies to get their current states (i.e. replay the old streams if necessary), then read from the horizon (or the stored offset)
 	shards, err := k.getShards(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shards")
 	}
-	shardConfiguration := k.buildShardConfiguration(shards)
-	return shardConfiguration, nil
+	shardConfig := k.buildShardConfiguration(shards)
+	leasedShards, err := k.leaseShards(ctx, shardConfig.active)
+	if err != nil {
+		return nil, fmt.Errorf("failed to lease shards")
+	}
+	return &shardConfiguration{
+		dependencyGraph: shardConfig.dependencyGraph,
+		shards:          shardConfig.shards,
+		active:          leasedShards,
+	}, nil
 }
 
 func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []string) ([]string, error) {
-	lockKey := k.getLockKey()
-	lock, err := k.lockClient.Acquire(ctx, lockKey, lockDuration)
+	leaseLockKey := k.getLeaseLockKey()
+	leaseLock, err := k.lockClient.Acquire(ctx, leaseLockKey, lockDuration)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get lock, err=%w", err)
 	}
-	defer lock.Release(ctx)
+	defer leaseLock.Release(ctx)
 	hashRing, err := k.loadHashRing(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load hash ring, err=%w", err)
@@ -105,11 +115,34 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []st
 			shardCandidates = append(shardCandidates, activeShards[i])
 		}
 	}
-	leasedShards := []string{}
+	leasedShards := map[string]lock.Lock{}
 	for _, shard := range shardCandidates {
-		// **** Now this logic becomes more complex because of our lock setup -> we need to actively extend the ones we have or try to acquire the new ones
+		if lock, ok := k.leasedShards[shard]; ok {
+			err := lock.Extend(ctx, k.leaseDuration)
+			if err != nil {
+				continue
+			}
+			leasedShards[shard] = lock
+		}
+		shardLockKey := k.getShardLockKey()
+		lock, err := k.lockClient.Acquire(ctx, shardLockKey, k.leaseDuration)
+		if err != nil {
+			continue
+		}
+		leasedShards[shard] = lock
 	}
-	return leasedShards, nil
+	for shard, lock := range k.leasedShards {
+		if _, ok := leasedShards[shard]; !ok {
+			lock.Release(ctx)
+		}
+	}
+	k.leasedShards = leasedShards
+	leasedShardValues := []string{}
+	for shard := range leasedShards {
+		leasedShardValues = append(leasedShardValues, shard)
+	}
+
+	return leasedShardValues, nil
 }
 
 func (k *kinesisShardManager) getShards(ctx context.Context) ([]*types.Shard, error) {
@@ -188,13 +221,17 @@ func (k *kinesisShardManager) buildShardConfiguration(shards []*types.Shard) *sh
 	}
 	return &shardConfiguration{
 		dependencyGraph: graph,
-		active:          activeShards,
 		shards:          shardMap,
+		active:          activeShards,
 	}
 }
 
-func (k *kinesisShardManager) getLockKey() string {
-	return fmt.Sprintf("lock:%s:%s:%s", keyPrefix, k.appID, k.streamName)
+func (k *kinesisShardManager) getLeaseLockKey() string {
+	return fmt.Sprintf("lock:lease:%s:%s:%s", keyPrefix, k.appID, k.streamName)
+}
+
+func (k *kinesisShardManager) getShardLockKey() string {
+	return fmt.Sprintf("lock:shard:%s:%s:%s", keyPrefix, k.appID, k.streamName)
 }
 
 func (k *kinesisShardManager) getHashRingKey() string {
