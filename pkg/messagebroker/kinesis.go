@@ -15,6 +15,13 @@ func NewKinesisProducer(kinesisClient *kinesis.Client, streamName string) Produc
 	}
 }
 
+func NewKinesisConsumer(kinesisClient *kinesis.Client, streamName string) Consumer {
+	return &kinesisConsumer{
+		kinesisClient: kinesisClient,
+		streamName:    streamName,
+	}
+}
+
 type kinesisProducer struct {
 	kinesisClient *kinesis.Client
 	streamName    string
@@ -31,4 +38,19 @@ func (k *kinesisProducer) Send(ctx context.Context, message *Message) error {
 		return fmt.Errorf("failed to send message to kinesis, key=%s, body=%s, err=%w", message.PartitionKey, message.Body, err)
 	}
 	return nil
+}
+
+type kinesisConsumer struct {
+	kinesisClient *kinesis.Client
+	streamName    string
+}
+
+func (k *kinesisConsumer) Consume(ctx context.Context, handler func() MessageHandler) error {
+	activeShards := map[string]context.CancelFunc{}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }

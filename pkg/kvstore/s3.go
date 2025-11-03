@@ -5,21 +5,22 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
-
-type s3Client struct {
-	s3     *s3.Client
-	bucket string
-}
 
 func NewS3Client(s3c *s3.Client, bucket string) Client {
 	return &s3Client{
 		s3:     s3c,
 		bucket: bucket,
 	}
+}
+
+type s3Client struct {
+	s3     *s3.Client
+	bucket string
 }
 
 func (s *s3Client) Get(ctx context.Context, key string) (string, error) {
@@ -49,4 +50,8 @@ func (s *s3Client) Put(ctx context.Context, key string, value string) error {
 		return fmt.Errorf("failed to put object, err=%w", err)
 	}
 	return nil
+}
+
+func (s *s3Client) PutWithExpiry(ctx context.Context, key string, value string, expiresAt time.Time) error {
+	panic("s3 client does not support put with expiry")
 }
