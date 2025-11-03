@@ -2,7 +2,6 @@ package kvstore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -40,7 +39,7 @@ func (d *dynamoClient) Get(ctx context.Context, key string) (string, error) {
 		return "", fmt.Errorf("failed to get item, err=%w", err)
 	}
 	if out.Item == nil {
-		return "", errors.New("item not found")
+		return "", ErrNotFound
 	}
 	valAttr, ok := out.Item[d.valueKey].(*types.AttributeValueMemberS)
 	if !ok {

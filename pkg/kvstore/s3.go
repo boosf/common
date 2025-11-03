@@ -3,12 +3,14 @@ package kvstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 func NewS3Client(s3c *s3.Client, bucket string) Client {
@@ -29,6 +31,10 @@ func (s *s3Client) Get(ctx context.Context, key string) (string, error) {
 		Key:    aws.String(key),
 	})
 	if err != nil {
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return "", ErrNotFound
+		}
 		return "", fmt.Errorf("failed to get object, err=%w", err)
 	}
 	defer out.Body.Close()

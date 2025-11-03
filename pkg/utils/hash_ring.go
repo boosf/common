@@ -41,7 +41,15 @@ type serializedKeyData struct {
 	ExpiresAt *time.Time `json:"expiresAt"`
 }
 
-func (h *HashRing) Add(partition string, expiresAt *time.Time) {
+func (h *HashRing) Add(partition string) {
+	h.add(partition, nil)
+}
+
+func (h *HashRing) AddWithExpiry(partition string, expiresAt time.Time) {
+	h.add(partition, &expiresAt)
+}
+
+func (h *HashRing) add(partition string, expiresAt *time.Time) {
 	hash := h.getHash(partition)
 	out, ok := h.keyData[hash]
 	if ok {
