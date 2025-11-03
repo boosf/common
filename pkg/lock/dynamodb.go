@@ -22,7 +22,7 @@ func NewDynamoClient(
 	expiresAtKeyName string,
 	ttlKeyName string,
 ) Client {
-	return &dynamoClient{
+	template := &dynamoTemplate{
 		dynamodbClient:   dynamodbClient,
 		clockClient:      clockClient,
 		expiry:           expiry,
@@ -32,9 +32,10 @@ func NewDynamoClient(
 		expiresAtKeyName: expiresAtKeyName,
 		ttlKeyName:       ttlKeyName,
 	}
+	return New(template)
 }
 
-type dynamoClient struct {
+type dynamoTemplate struct {
 	dynamodbClient   *dynamodb.Client
 	clockClient      clock.Client
 	expiry           time.Duration
@@ -51,25 +52,7 @@ type lockExpiry struct {
 	ttl       string
 }
 
-func (d *dynamoClient) Acquire(ctx context.Context, key string, duration time.Duration, options ...lockOption) (Lock, error) {
-	config := newLockConfig()
-	for _, option := range options {
-		config = option.Apply(config)
-	}
-	errs := []error{}
-	for attempt := range config.Retries {
-		lock, err := d.acquire(ctx, key, duration)
-		if err != nil {
-			errs = append(errs, err)
-			config.RetryStrategy.WaitFor(attempt)
-			continue
-		}
-		return lock, nil
-	}
-	return nil, fmt.Errorf("failed to acquire lock, key=%s, err=%w", key, errors.Join(errs...))
-}
-
-func (d *dynamoClient) acquire(ctx context.Context, key string, duration time.Duration) (Lock, error) {
+func (d *dynamoTemplate) Acquire(ctx context.Context, key string, duration time.Duration) (Lock, error) {
 	input := d.buildAcquireInput(key, duration)
 	out, err := d.dynamodbClient.UpdateItem(ctx, input)
 	if err != nil {
@@ -82,7 +65,7 @@ func (d *dynamoClient) acquire(ctx context.Context, key string, duration time.Du
 	return &dynamoLock{dynamoClient: d, key: key, id: idAttr.Value}, nil
 }
 
-func (d *dynamoClient) buildAcquireInput(key string, duration time.Duration) *dynamodb.UpdateItemInput {
+func (d *dynamoTemplate) buildAcquireInput(key string, duration time.Duration) *dynamodb.UpdateItemInput {
 	lockExpiry := d.getLockExpiry(duration)
 	return &dynamodb.UpdateItemInput{
 		TableName: aws.String(d.table),
@@ -108,7 +91,7 @@ func (d *dynamoClient) buildAcquireInput(key string, duration time.Duration) *dy
 	}
 }
 
-func (d *dynamoClient) getLockExpiry(duration time.Duration) *lockExpiry {
+func (d *dynamoTemplate) getLockExpiry(duration time.Duration) *lockExpiry {
 	now := d.clockClient.UnixNow()
 	expiresAt := now + int64(duration.Seconds())
 	ttl := now + int64(d.expiry.Seconds())
@@ -120,7 +103,7 @@ func (d *dynamoClient) getLockExpiry(duration time.Duration) *lockExpiry {
 }
 
 type dynamoLock struct {
-	dynamoClient *dynamoClient
+	dynamoClient *dynamoTemplate
 	key          string
 	id           string
 }
