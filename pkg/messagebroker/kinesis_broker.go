@@ -28,6 +28,7 @@ func NewKinesisConsumer(
 	streamName string,
 	shardManager *kinesisShardManager,
 	shardRefresh time.Duration,
+	workerPoll time.Duration,
 ) Consumer {
 	return &kinesisConsumer{
 		kinesisClient: kinesisClient,
@@ -35,6 +36,7 @@ func NewKinesisConsumer(
 		streamName:    streamName,
 		shardManager:  shardManager,
 		shardRefresh:  shardRefresh,
+		workerPoll:    workerPoll,
 
 		shardWorkers: map[string]context.CancelFunc{},
 	}
@@ -53,7 +55,7 @@ func (k *kinesisProducer) Send(ctx context.Context, message *Message) error {
 	}
 	_, err := k.kinesisClient.PutRecord(ctx, input)
 	if err != nil {
-		return fmt.Errorf("failed to send message to kinesis, key=%s, body=%s, err=%w", message.PartitionKey, message.Body, err)
+		return fmt.Errorf("failed to send message to kinesis, err=%w", err)
 	}
 	return nil
 }
@@ -64,6 +66,7 @@ type kinesisConsumer struct {
 	streamName    string
 	shardManager  *kinesisShardManager
 	shardRefresh  time.Duration
+	workerPoll    time.Duration
 
 	shardWorkers map[string]context.CancelFunc
 }
@@ -116,7 +119,61 @@ func (k *kinesisConsumer) consume(ctx context.Context, handlerFactory MessageHan
 }
 
 func (k *kinesisConsumer) worker(ctx context.Context, shardConfig *shardConfiguration, shard string, handlerFactory MessageHandlerFactory) error {
-	// **** We need to check if there is a checkpoint, and if not then we need to check if there is a parent and it has a checkpoint and so on. We will then merge all the workers
+	checkpoint, err := k.loadCheckpoint(ctx, shardConfig, shard, handlerFactory)
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoint, err=%w", err)
+	}
+	it, err := k.kinesisClient.GetShardIterator(ctx, &kinesis.GetShardIteratorInput{
+		StreamName:             aws.String(k.streamName),
+		ShardId:                aws.String(shard),
+		ShardIteratorType:      types.ShardIteratorTypeAfterSequenceNumber,
+		StartingSequenceNumber: aws.String(checkpoint.metadata.Offset),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get shard iterator, err=%w", err)
+	}
+	iter := it.ShardIterator
+	ticker := time.NewTicker(k.workerPoll)
+	for iter != nil {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			out, err := k.kinesisClient.GetRecords(ctx, &kinesis.GetRecordsInput{
+				ShardIterator: iter,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to get records, err=%w", err)
+			}
+			var lastOffset *string
+			for _, record := range out.Records {
+				if record.PartitionKey == nil || record.SequenceNumber == nil {
+					continue
+				}
+				message := &Message{
+					PartitionKey: *record.PartitionKey,
+					Body:         string(record.Data),
+				}
+				if err := checkpoint.handler.Handle(ctx, message); err != nil {
+					return fmt.Errorf("failed to handle message, err=%w", err)
+				}
+				lastOffset = record.SequenceNumber
+			}
+			iter = out.NextShardIterator
+			if lastOffset != nil {
+				if err := checkpoint.handler.SaveCheckpoint(ctx, &CheckpointMetadata{
+					CheckpointKey: k.buildCheckpointID(),
+					AppID:         k.appID,
+					Topic:         k.streamName,
+					Partition:     shard,
+					Offset:        *lastOffset,
+				}); err != nil {
+					return fmt.Errorf("failed to save checkpoint, err=%w", err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (k *kinesisConsumer) loadCheckpoint(ctx context.Context, shardConfig *shardConfiguration, shard string, handlerFactory MessageHandlerFactory) (*checkpoint, error) {
@@ -134,7 +191,7 @@ func (k *kinesisConsumer) loadCheckpoint(ctx context.Context, shardConfig *shard
 	}
 	shardMetadata, ok := shardConfig.shards[shard]
 	if !ok {
-		return nil, fmt.Errorf("shard not in shards config, shard=%s", shard)
+		return nil, errors.New("shard not in shards config")
 	}
 	dependentShards := k.buildDependentShards(shardMetadata)
 	dependentHandler, err := k.loadDependentHandler(ctx, shardConfig, dependentShards, handlerFactory)
