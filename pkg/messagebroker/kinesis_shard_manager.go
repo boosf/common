@@ -20,7 +20,7 @@ const (
 	lockDuration = 10 * time.Second
 )
 
-func newKinesisShardManager(
+func NewKinesisShardManager(
 	kinesisClient *kinesis.Client,
 	lockClient lock.Client,
 	kvstoreClient kvstore.Client,
@@ -90,7 +90,7 @@ func (k *kinesisShardManager) AcquireShards(ctx context.Context) (*shardConfigur
 }
 
 func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []string) ([]string, error) {
-	leaseLockKey := k.getLeaseLockKey()
+	leaseLockKey := k.buildLeaseLockKey()
 	leaseLock, err := k.lockClient.Acquire(ctx, leaseLockKey, lockDuration)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get lock, err=%w", err)
@@ -124,7 +124,7 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []st
 			}
 			leasedShards[shard] = lock
 		}
-		shardLockKey := k.getShardLockKey()
+		shardLockKey := k.buildShardLockKey()
 		lock, err := k.lockClient.Acquire(ctx, shardLockKey, k.leaseDuration)
 		if err != nil {
 			continue
@@ -170,7 +170,7 @@ func (k *kinesisShardManager) getShards(ctx context.Context) ([]*types.Shard, er
 
 func (k *kinesisShardManager) loadHashRing(ctx context.Context) (*utils.HashRing, error) {
 	hashRing := utils.New(k.clockClient)
-	hashRingKey := k.getHashRingKey()
+	hashRingKey := k.buildHashRingKey()
 	hashRingPayload, err := k.kvstoreClient.Get(ctx, hashRingKey)
 	if err != nil {
 		if errors.As(err, kvstore.ErrNotFound) {
@@ -185,7 +185,7 @@ func (k *kinesisShardManager) loadHashRing(ctx context.Context) (*utils.HashRing
 }
 
 func (k *kinesisShardManager) saveHashRing(ctx context.Context, hashRing *utils.HashRing) error {
-	hashRingKey := k.getHashRingKey()
+	hashRingKey := k.buildHashRingKey()
 	hashRingPayload, err := hashRing.MarshalJSON()
 	if err != nil {
 		return fmt.Errorf("failed to marshal hash ring, err=%w", err)
@@ -226,14 +226,14 @@ func (k *kinesisShardManager) buildShardConfiguration(shards []*types.Shard) *sh
 	}
 }
 
-func (k *kinesisShardManager) getLeaseLockKey() string {
+func (k *kinesisShardManager) buildLeaseLockKey() string {
 	return fmt.Sprintf("lock:lease:%s:%s:%s", keyPrefix, k.appID, k.streamName)
 }
 
-func (k *kinesisShardManager) getShardLockKey() string {
+func (k *kinesisShardManager) buildShardLockKey() string {
 	return fmt.Sprintf("lock:shard:%s:%s:%s", keyPrefix, k.appID, k.streamName)
 }
 
-func (k *kinesisShardManager) getHashRingKey() string {
+func (k *kinesisShardManager) buildHashRingKey() string {
 	return fmt.Sprintf("hash_ring:%s:%s:%s", keyPrefix, k.appID, k.streamName)
 }

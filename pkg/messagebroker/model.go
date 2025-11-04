@@ -11,5 +11,5 @@ type CheckpointMetadata struct {
 	AppID     string // In Kafka represents consumer group, Kinesis some unique identifier
 	Topic     string // In Kafka represents topic, Kinesis represents stream
 	Partition string // In Kafka represents partition, Kinesis represents shard
-	Offset    int64  // The current offset for the partition
+	Offset    string // The current offset for the partition
 }

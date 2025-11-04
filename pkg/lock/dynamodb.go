@@ -66,7 +66,7 @@ func (d *dynamoTemplate) Acquire(ctx context.Context, key string, duration time.
 }
 
 func (d *dynamoTemplate) buildAcquireInput(key string, duration time.Duration) *dynamodb.UpdateItemInput {
-	lockExpiry := d.getLockExpiry(duration)
+	lockExpiry := d.buildLockExpiry(duration)
 	return &dynamodb.UpdateItemInput{
 		TableName: aws.String(d.table),
 		Key: map[string]types.AttributeValue{
@@ -91,7 +91,7 @@ func (d *dynamoTemplate) buildAcquireInput(key string, duration time.Duration) *
 	}
 }
 
-func (d *dynamoTemplate) getLockExpiry(duration time.Duration) *lockExpiry {
+func (d *dynamoTemplate) buildLockExpiry(duration time.Duration) *lockExpiry {
 	now := d.clockClient.UnixNow()
 	expiresAt := now + int64(duration.Seconds())
 	ttl := now + int64(d.expiry.Seconds())
@@ -120,7 +120,7 @@ func (d *dynamoLock) Extend(ctx context.Context, duration time.Duration) error {
 
 func (d *dynamoLock) buildExtendInput(duration time.Duration) *dynamodb.UpdateItemInput {
 	dynamoClient := d.dynamoClient
-	lockExpiry := dynamoClient.getLockExpiry(duration)
+	lockExpiry := dynamoClient.buildLockExpiry(duration)
 	return &dynamodb.UpdateItemInput{
 		TableName: aws.String(dynamoClient.table),
 		Key: map[string]types.AttributeValue{
