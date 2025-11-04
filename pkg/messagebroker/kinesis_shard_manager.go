@@ -141,7 +141,9 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []st
 	for shard := range leasedShards {
 		leasedShardValues = append(leasedShardValues, shard)
 	}
-
+	if err := k.saveHashRing(ctx, hashRing); err != nil {
+		return nil, fmt.Errorf("failed to save hash ring, err=%w", err)
+	}
 	return leasedShardValues, nil
 }
 
@@ -173,12 +175,12 @@ func (k *kinesisShardManager) loadHashRing(ctx context.Context) (*utils.HashRing
 	hashRingKey := k.buildHashRingKey()
 	hashRingPayload, err := k.kvstoreClient.Get(ctx, hashRingKey)
 	if err != nil {
-		if errors.As(err, kvstore.ErrNotFound) {
+		if errors.Is(err, kvstore.ErrNotFound) {
 			return hashRing, nil
 		}
 		return nil, fmt.Errorf("failed to load value, err=%w", err)
 	}
-	if hashRing.UnmarshalJSON([]byte(hashRingPayload)); err != nil {
+	if err := hashRing.UnmarshalJSON([]byte(hashRingPayload)); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal hash ring, err=%w", err)
 	}
 	return hashRing, nil
