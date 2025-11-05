@@ -2,6 +2,7 @@ package messagebroker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -98,17 +99,10 @@ func (k *kinesisConsumer) reloadWorker(ctx context.Context, handlerFactory Messa
 			delete(k.shardWorkers, shardID)
 		}
 	}
-	for shardID, shard := range shardMap {
-		if _, ok := k.shardWorkers[shardID]; ok {
-			continue
+	for _, shard := range shardMap {
+		if err := k.startWorker(ctx, shard, handlerFactory); err != nil {
+			return fmt.Errorf("failed to start worker, err=%w", err)
 		}
-		workerCtx, cancelFunc := context.WithCancel(ctx)
-		go func() {
-			if err := k.work(workerCtx, shard, handlerFactory); err != nil {
-				delete(k.shardWorkers, shardID)
-			}
-		}()
-		k.shardWorkers[shardID] = cancelFunc
 	}
 	return nil
 }
@@ -119,6 +113,20 @@ func (k *kinesisConsumer) buildShardMap(shards []*shardMetadata) map[string]*sha
 		out[shard.id] = shard
 	}
 	return out
+}
+
+func (k *kinesisConsumer) startWorker(ctx context.Context, shard *shardMetadata, handlerFactory MessageHandlerFactory) error {
+	if _, ok := k.shardWorkers[shard.id]; ok {
+		return errors.New("shard does not exist")
+	}
+	workerCtx, cancelFunc := context.WithCancel(ctx)
+	go func() {
+		if err := k.work(workerCtx, shard, handlerFactory); err != nil {
+			delete(k.shardWorkers, shard.id)
+		}
+	}()
+	k.shardWorkers[shard.id] = cancelFunc
+	return nil
 }
 
 func (k *kinesisConsumer) work(ctx context.Context, shard *shardMetadata, handlerFactory MessageHandlerFactory) error {
@@ -222,14 +230,19 @@ func (k *kinesisConsumer) loadDependentHandler(ctx context.Context, dependentSha
 			return nil, fmt.Errorf("failed to read shard, err=%w", err)
 		}
 	}
+	handler := k.mergeHandlers(handlers, handlerFactory)
+	return handler, nil
+}
+
+func (k *kinesisConsumer) mergeHandlers(handlers []MessageHandler, handlerFactory MessageHandlerFactory) MessageHandler {
 	if len(handlers) == 0 {
-		return handlerFactory(), nil
+		return handlerFactory()
 	}
 	out := handlers[0]
 	for i := 1; i <= len(handlers); i++ {
 		out.Merge(handlers[i])
 	}
-	return out, nil
+	return out
 }
 
 func (k *kinesisConsumer) readShard(ctx context.Context, shard *shardMetadata, handler MessageHandler, offset *string) (string, error) {
