@@ -31,12 +31,12 @@ func NewKinesisConsumer(
 	workerPoll time.Duration,
 ) Consumer {
 	return &kinesisConsumer{
-		kinesisClient: kinesisClient,
-		appID:         appID,
-		streamName:    streamName,
-		shardManager:  shardManager,
-		shardRefresh:  shardRefresh,
-		workerPoll:    workerPoll,
+		kinesisClient:  kinesisClient,
+		appID:          appID,
+		streamName:     streamName,
+		shardManager:   shardManager,
+		shardRefresher: time.NewTicker(shardRefresh),
+		workerPoller:   time.NewTicker(workerPoll),
 
 		shardWorkers: map[string]context.CancelFunc{},
 	}
@@ -65,10 +65,10 @@ type kinesisConsumer struct {
 	appID         string
 	streamName    string
 	shardManager  *kinesisShardManager
-	shardRefresh  time.Duration
-	workerPoll    time.Duration
 
-	shardWorkers map[string]context.CancelFunc
+	shardRefresher *time.Ticker
+	workerPoller   *time.Ticker
+	shardWorkers   map[string]context.CancelFunc
 }
 
 type checkpoint struct {
@@ -77,12 +77,11 @@ type checkpoint struct {
 }
 
 func (k *kinesisConsumer) Consume(ctx context.Context, handlerFactory MessageHandlerFactory) error {
-	ticker := time.NewTicker(k.shardRefresh)
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-k.shardRefresher.C:
 			k.consume(ctx, handlerFactory)
 		}
 	}
@@ -133,12 +132,11 @@ func (k *kinesisConsumer) worker(ctx context.Context, shardConfig *shardConfigur
 		return fmt.Errorf("failed to get shard iterator, err=%w", err)
 	}
 	iter := it.ShardIterator
-	ticker := time.NewTicker(k.workerPoll)
 	for iter != nil {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-k.workerPoller.C:
 			out, err := k.kinesisClient.GetRecords(ctx, &kinesis.GetRecordsInput{
 				ShardIterator: iter,
 			})

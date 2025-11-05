@@ -66,30 +66,27 @@ type kinesisShardManager struct {
 	leasedShards map[string]lock.Lock
 }
 
-type shardConfiguration struct {
-	dependencyGraph map[string][]string
-	shards          map[string]*types.Shard
-	active          []string
+type shardMetadata struct {
+	id          string
+	dependent   []*shardMetadata
+	startOffset string
+	endOffset   *string
 }
 
-func (k *kinesisShardManager) AcquireShards(ctx context.Context) (*shardConfiguration, error) {
+func (k *kinesisShardManager) AcquireShards(ctx context.Context) ([]*shardMetadata, error) {
 	shards, err := k.getShards(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get shards")
+		return nil, fmt.Errorf("failed to get shards, err=%w", err)
 	}
-	shardConfig := k.buildShardConfiguration(shards)
-	leasedShards, err := k.leaseShards(ctx, shardConfig.active)
+	activeShards := k.buildActiveShards(shards)
+	leasedShards, err := k.leaseShards(ctx, activeShards)
 	if err != nil {
-		return nil, fmt.Errorf("failed to lease shards")
+		return nil, fmt.Errorf("failed to lease shards, err=%w", err)
 	}
-	return &shardConfiguration{
-		dependencyGraph: shardConfig.dependencyGraph,
-		shards:          shardConfig.shards,
-		active:          leasedShards,
-	}, nil
+	return leasedShards, nil
 }
 
-func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []string) ([]string, error) {
+func (k *kinesisShardManager) leaseShards(ctx context.Context, shards []*shardMetadata) ([]*shardMetadata, error) {
 	leaseLockKey := k.buildLeaseLockKey()
 	leaseLock, err := k.lockClient.Acquire(ctx, leaseLockKey, lockDuration)
 	if err != nil {
@@ -102,21 +99,30 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []st
 	}
 	hashRingPartitionExpires := k.clockClient.TimeFromNow(k.hashRingPartitionExpiry)
 	hashRing.AddWithExpiry(k.nodeID, hashRingPartitionExpires)
-	partitions, err := hashRing.Get(activeShards)
+	shardIDs := k.convertShardToShardID(shards)
+	leasedShardIDs, err := k.updateLease(ctx, shardIDs, hashRing)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update lease, err=%w", err)
+	}
+	if err := k.saveHashRing(ctx, hashRing); err != nil {
+		return nil, fmt.Errorf("failed to save hash ring, err=%w", err)
+	}
+	return k.convertShardIDToShard(leasedShardIDs, shards), nil
+}
+
+func (k *kinesisShardManager) updateLease(ctx context.Context, shardIDs []string, hashRing *utils.HashRing) ([]string, error) {
+	partitions, err := hashRing.Get(shardIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get shards, err=%w", err)
 	}
-	if len(partitions) != len(activeShards) {
-		return nil, fmt.Errorf("partition length different than active shards, expected=%d, actual=%d", len(activeShards), len(partitions))
-	}
-	shardCandidates := []string{}
+	leaseCandidates := []string{}
 	for i := range partitions {
 		if partitions[i] == k.nodeID {
-			shardCandidates = append(shardCandidates, activeShards[i])
+			leaseCandidates = append(leaseCandidates, shardIDs[i])
 		}
 	}
 	leasedShards := map[string]lock.Lock{}
-	for _, shard := range shardCandidates {
+	for _, shard := range leaseCandidates {
 		if lock, ok := k.leasedShards[shard]; ok {
 			err := lock.Extend(ctx, k.leaseDuration)
 			if err != nil {
@@ -124,7 +130,7 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []st
 			}
 			leasedShards[shard] = lock
 		}
-		shardLockKey := k.buildShardLockKey()
+		shardLockKey := k.buildShardLockKey(shard)
 		lock, err := k.lockClient.Acquire(ctx, shardLockKey, k.leaseDuration)
 		if err != nil {
 			continue
@@ -137,14 +143,33 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, activeShards []st
 		}
 	}
 	k.leasedShards = leasedShards
-	leasedShardValues := []string{}
+	leasedShardKeys := []string{}
 	for shard := range leasedShards {
-		leasedShardValues = append(leasedShardValues, shard)
+		leasedShardKeys = append(leasedShardKeys, shard)
 	}
-	if err := k.saveHashRing(ctx, hashRing); err != nil {
-		return nil, fmt.Errorf("failed to save hash ring, err=%w", err)
+	return leasedShardKeys, nil
+}
+
+func (k *kinesisShardManager) convertShardToShardID(shards []*shardMetadata) []string {
+	out := []string{}
+	for _, shard := range shards {
+		out = append(out, shard.id)
 	}
-	return leasedShardValues, nil
+	return out
+}
+
+func (k *kinesisShardManager) convertShardIDToShard(shardIDs []string, shards []*shardMetadata) []*shardMetadata {
+	shardMap := map[string]*shardMetadata{}
+	for _, shard := range shards {
+		shardMap[shard.id] = shard
+	}
+	out := []*shardMetadata{}
+	for _, shardID := range shardIDs {
+		if shardMetadata, ok := shardMap[shardID]; ok {
+			out = append(out, shardMetadata)
+		}
+	}
+	return out
 }
 
 func (k *kinesisShardManager) getShards(ctx context.Context) ([]*types.Shard, error) {
@@ -168,6 +193,59 @@ func (k *kinesisShardManager) getShards(ctx context.Context) ([]*types.Shard, er
 		nextToken = output.NextToken
 	}
 	return shards, nil
+}
+
+func (k *kinesisShardManager) buildActiveShards(shards []*types.Shard) []*shardMetadata {
+	activeShards := []*shardMetadata{}
+	shardMap := k.buildShardMap(shards)
+	shardMetadataMap := map[string]*shardMetadata{}
+	for _, shard := range shards {
+		shardMetadata := k.buildShardMetadata(shard, shardMap, shardMetadataMap)
+		if shardMetadata.endOffset == nil {
+			activeShards = append(activeShards, shardMetadata)
+		}
+	}
+	return activeShards
+}
+
+func (k *kinesisShardManager) buildShardMap(shards []*types.Shard) map[string]*types.Shard {
+	out := map[string]*types.Shard{}
+	for _, shard := range shards {
+		if shard.ShardId == nil {
+			continue
+		}
+		out[*shard.ShardId] = shard
+	}
+	return out
+}
+
+func (k *kinesisShardManager) buildShardMetadata(shard *types.Shard, shardMap map[string]*types.Shard, shardMetadataMap map[string]*shardMetadata) *shardMetadata {
+	if shard.ShardId == nil || shard.SequenceNumberRange == nil || shard.SequenceNumberRange.StartingSequenceNumber == nil {
+		return nil
+	}
+	if shardMetadata, ok := shardMetadataMap[*shard.ShardId]; ok {
+		return shardMetadata
+	}
+	out := &shardMetadata{
+		id:          *shard.ShardId,
+		dependent:   []*shardMetadata{},
+		startOffset: *shard.SequenceNumberRange.StartingSequenceNumber,
+		endOffset:   shard.SequenceNumberRange.EndingSequenceNumber,
+	}
+	if shard.ParentShardId != nil {
+		parent, ok := shardMap[*shard.ParentShardId]
+		if ok {
+			out.dependent = append(out.dependent, k.buildShardMetadata(parent, shardMap, shardMetadataMap))
+		}
+	}
+	if shard.AdjacentParentShardId != nil {
+		adjacent, ok := shardMap[*shard.AdjacentParentShardId]
+		if ok {
+			out.dependent = append(out.dependent, k.buildShardMetadata(adjacent, shardMap, shardMetadataMap))
+		}
+	}
+	shardMetadataMap[*shard.ShardId] = out
+	return out
 }
 
 func (k *kinesisShardManager) loadHashRing(ctx context.Context) (*utils.HashRing, error) {
@@ -199,41 +277,12 @@ func (k *kinesisShardManager) saveHashRing(ctx context.Context, hashRing *utils.
 	return nil
 }
 
-func (k *kinesisShardManager) buildShardConfiguration(shards []*types.Shard) *shardConfiguration {
-	graph := map[string][]string{}
-	activeShards := []string{}
-	shardMap := map[string]*types.Shard{}
-	for _, shard := range shards {
-		if shard.ShardId == nil || shard.SequenceNumberRange == nil {
-			continue
-		}
-		shardID := *shard.ShardId
-		shardMap[shardID] = shard
-		dependent := []string{}
-		if shard.ParentShardId != nil {
-			dependent = append(dependent, *shard.ParentShardId)
-		}
-		if shard.AdjacentParentShardId != nil {
-			dependent = append(dependent, *shard.AdjacentParentShardId)
-		}
-		graph[shardID] = dependent
-		if shard.SequenceNumberRange.EndingSequenceNumber == nil {
-			activeShards = append(activeShards, shardID)
-		}
-	}
-	return &shardConfiguration{
-		dependencyGraph: graph,
-		shards:          shardMap,
-		active:          activeShards,
-	}
-}
-
 func (k *kinesisShardManager) buildLeaseLockKey() string {
 	return fmt.Sprintf("lock:lease:%s:%s:%s", keyPrefix, k.appID, k.streamName)
 }
 
-func (k *kinesisShardManager) buildShardLockKey() string {
-	return fmt.Sprintf("lock:shard:%s:%s:%s", keyPrefix, k.appID, k.streamName)
+func (k *kinesisShardManager) buildShardLockKey(shardID string) string {
+	return fmt.Sprintf("lock:shard:%s:%s:%s:%s", keyPrefix, k.appID, k.streamName, shardID)
 }
 
 func (k *kinesisShardManager) buildHashRingKey() string {
