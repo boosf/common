@@ -104,7 +104,7 @@ func (k *kinesisConsumer) reloadWorker(ctx context.Context, handlerFactory Messa
 		}
 		workerCtx, cancelFunc := context.WithCancel(ctx)
 		go func() {
-			if err := k.worker(workerCtx, shard, handlerFactory); err != nil {
+			if err := k.work(workerCtx, shard, handlerFactory); err != nil {
 				delete(k.shardWorkers, shardID)
 			}
 		}()
@@ -121,16 +121,17 @@ func (k *kinesisConsumer) buildShardMap(shards []*shardMetadata) map[string]*sha
 	return out
 }
 
-func (k *kinesisConsumer) worker(ctx context.Context, shard *shardMetadata, handlerFactory MessageHandlerFactory) error {
+func (k *kinesisConsumer) work(ctx context.Context, shard *shardMetadata, handlerFactory MessageHandlerFactory) error {
 	checkpoint, err := k.loadCheckpoint(ctx, shard, handlerFactory)
 	if err != nil {
 		return fmt.Errorf("failed to load checkpoint, err=%w", err)
 	}
+	lastOffset := checkpoint.metadata.Offset
 	it, err := k.kinesisClient.GetShardIterator(ctx, &kinesis.GetShardIteratorInput{
 		StreamName:             aws.String(k.streamName),
 		ShardId:                aws.String(shard.id),
 		ShardIteratorType:      types.ShardIteratorTypeAfterSequenceNumber,
-		StartingSequenceNumber: aws.String(checkpoint.metadata.Offset),
+		StartingSequenceNumber: aws.String(lastOffset),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to get shard iterator, err=%w", err)
@@ -147,7 +148,6 @@ func (k *kinesisConsumer) worker(ctx context.Context, shard *shardMetadata, hand
 			if err != nil {
 				return fmt.Errorf("failed to get records, err=%w", err)
 			}
-			var lastOffset *string
 			for _, record := range out.Records {
 				if record.PartitionKey == nil || record.SequenceNumber == nil {
 					continue
@@ -159,19 +159,17 @@ func (k *kinesisConsumer) worker(ctx context.Context, shard *shardMetadata, hand
 				if err := checkpoint.handler.Handle(ctx, message); err != nil {
 					return fmt.Errorf("failed to handle message, err=%w", err)
 				}
-				lastOffset = record.SequenceNumber
+				lastOffset = *record.SequenceNumber
 			}
 			iter = out.NextShardIterator
-			if lastOffset != nil {
-				if err := checkpoint.handler.SaveCheckpoint(ctx, &CheckpointMetadata{
-					CheckpointKey: k.buildCheckpointID(),
-					AppID:         k.appID,
-					Topic:         k.streamName,
-					Partition:     shard.id,
-					Offset:        *lastOffset,
-				}); err != nil {
-					return fmt.Errorf("failed to save checkpoint, err=%w", err)
-				}
+			if err := checkpoint.handler.SaveCheckpoint(ctx, &CheckpointMetadata{
+				CheckpointKey: k.buildCheckpointID(),
+				AppID:         k.appID,
+				Topic:         k.streamName,
+				Partition:     shard.id,
+				Offset:        lastOffset,
+			}); err != nil {
+				return fmt.Errorf("failed to save checkpoint, err=%w", err)
 			}
 		}
 	}
