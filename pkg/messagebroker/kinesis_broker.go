@@ -2,7 +2,6 @@ package messagebroker
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -82,49 +81,54 @@ func (k *kinesisConsumer) Consume(ctx context.Context, handlerFactory MessageHan
 		case <-ctx.Done():
 			return nil
 		case <-k.shardRefresher.C:
-			k.consume(ctx, handlerFactory)
+			k.reloadWorker(ctx, handlerFactory)
 		}
 	}
 }
 
-func (k *kinesisConsumer) consume(ctx context.Context, handlerFactory MessageHandlerFactory) error {
-	shardConfig, err := k.shardManager.AcquireShards(ctx)
+func (k *kinesisConsumer) reloadWorker(ctx context.Context, handlerFactory MessageHandlerFactory) error {
+	shards, err := k.shardManager.AcquireShards(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire shards, err=%w", err)
 	}
-	activeShardSet := map[string]struct{}{}
-	for _, shard := range shardConfig.active {
-		activeShardSet[shard] = struct{}{}
-	}
-	for shard, cancelFunc := range k.shardWorkers {
-		if _, ok := activeShardSet[shard]; !ok {
+	shardMap := k.buildShardMap(shards)
+	for shardID, cancelFunc := range k.shardWorkers {
+		if _, ok := shardMap[shardID]; !ok {
 			cancelFunc()
-			delete(k.shardWorkers, shard)
+			delete(k.shardWorkers, shardID)
 		}
 	}
-	for shard := range activeShardSet {
-		if _, ok := k.shardWorkers[shard]; ok {
+	for shardID, shard := range shardMap {
+		if _, ok := k.shardWorkers[shardID]; ok {
 			continue
 		}
 		workerCtx, cancelFunc := context.WithCancel(ctx)
 		go func() {
-			if err := k.worker(workerCtx, shardConfig, shard, handlerFactory); err != nil {
-				delete(k.shardWorkers, shard)
+			if err := k.worker(workerCtx, shard, handlerFactory); err != nil {
+				delete(k.shardWorkers, shardID)
 			}
 		}()
-		k.shardWorkers[shard] = cancelFunc
+		k.shardWorkers[shardID] = cancelFunc
 	}
 	return nil
 }
 
-func (k *kinesisConsumer) worker(ctx context.Context, shardConfig *shardConfiguration, shard string, handlerFactory MessageHandlerFactory) error {
-	checkpoint, err := k.loadCheckpoint(ctx, shardConfig, shard, handlerFactory)
+func (k *kinesisConsumer) buildShardMap(shards []*shardMetadata) map[string]*shardMetadata {
+	out := map[string]*shardMetadata{}
+	for _, shard := range shards {
+		out[shard.id] = shard
+	}
+	return out
+}
+
+func (k *kinesisConsumer) worker(ctx context.Context, shard *shardMetadata, handlerFactory MessageHandlerFactory) error {
+	checkpoint, err := k.loadCheckpoint(ctx, shard, handlerFactory)
 	if err != nil {
 		return fmt.Errorf("failed to load checkpoint, err=%w", err)
 	}
 	it, err := k.kinesisClient.GetShardIterator(ctx, &kinesis.GetShardIteratorInput{
 		StreamName:             aws.String(k.streamName),
-		ShardId:                aws.String(shard),
+		ShardId:                aws.String(shard.id),
 		ShardIteratorType:      types.ShardIteratorTypeAfterSequenceNumber,
 		StartingSequenceNumber: aws.String(checkpoint.metadata.Offset),
 	})
@@ -163,7 +167,7 @@ func (k *kinesisConsumer) worker(ctx context.Context, shardConfig *shardConfigur
 					CheckpointKey: k.buildCheckpointID(),
 					AppID:         k.appID,
 					Topic:         k.streamName,
-					Partition:     shard,
+					Partition:     shard.id,
 					Offset:        *lastOffset,
 				}); err != nil {
 					return fmt.Errorf("failed to save checkpoint, err=%w", err)
@@ -174,7 +178,7 @@ func (k *kinesisConsumer) worker(ctx context.Context, shardConfig *shardConfigur
 	return nil
 }
 
-func (k *kinesisConsumer) loadCheckpoint(ctx context.Context, shardConfig *shardConfiguration, shard string, handlerFactory MessageHandlerFactory) (*checkpoint, error) {
+func (k *kinesisConsumer) loadCheckpoint(ctx context.Context, shard *shardMetadata, handlerFactory MessageHandlerFactory) (*checkpoint, error) {
 	checkpointID := k.buildCheckpointID()
 	handler := handlerFactory()
 	checkpointMetadata, err := handler.LoadCheckpoint(ctx, checkpointID)
@@ -187,16 +191,11 @@ func (k *kinesisConsumer) loadCheckpoint(ctx context.Context, shardConfig *shard
 			handler:  handler,
 		}, nil
 	}
-	shardMetadata, ok := shardConfig.shards[shard]
-	if !ok {
-		return nil, errors.New("shard not in shards config")
-	}
-	dependentShards := k.buildDependentShards(shardMetadata)
-	dependentHandler, err := k.loadDependentHandler(ctx, shardConfig, dependentShards, handlerFactory)
+	dependentHandler, err := k.loadDependentHandler(ctx, shard.dependent, handlerFactory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load dependent handler, err=%w", err)
 	}
-	offset, err := k.readShard(ctx, shardConfig, shard, dependentHandler, nil)
+	offset, err := k.readShard(ctx, shard, dependentHandler, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read shard, err=%w", err)
 	}
@@ -205,37 +204,24 @@ func (k *kinesisConsumer) loadCheckpoint(ctx context.Context, shardConfig *shard
 			CheckpointKey: checkpointID,
 			AppID:         k.appID,
 			Topic:         k.streamName,
-			Partition:     shard,
+			Partition:     shard.id,
 			Offset:        offset,
 		},
 		handler: dependentHandler,
 	}, nil
 }
 
-func (k *kinesisConsumer) buildDependentShards(shardMetadata *types.Shard) []string {
-	dependentShards := []string{}
-	parent := shardMetadata.ParentShardId
-	if parent != nil {
-		dependentShards = append(dependentShards, *parent)
-	}
-	adjacent := shardMetadata.AdjacentParentShardId
-	if adjacent != nil {
-		dependentShards = append(dependentShards, *adjacent)
-	}
-	return dependentShards
-}
-
-func (k *kinesisConsumer) loadDependentHandler(ctx context.Context, shardConfig *shardConfiguration, dependentShards []string, handlerFactory MessageHandlerFactory) (MessageHandler, error) {
+func (k *kinesisConsumer) loadDependentHandler(ctx context.Context, dependentShards []*shardMetadata, handlerFactory MessageHandlerFactory) (MessageHandler, error) {
 	handlers := []MessageHandler{}
 	for _, dependentShard := range dependentShards {
-		checkpoint, err := k.loadCheckpoint(ctx, shardConfig, dependentShard, handlerFactory)
+		checkpoint, err := k.loadCheckpoint(ctx, dependentShard, handlerFactory)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load parent checkpoint, err=%w", err)
 		}
 		handler := checkpoint.handler
 		offset := checkpoint.metadata.Offset
-		if _, err := k.readShard(ctx, shardConfig, dependentShard, handler, &offset); err != nil {
-			return nil, fmt.Errorf("failed to read shard, shard=%s, err=%w", dependentShard, err)
+		if _, err := k.readShard(ctx, dependentShard, handler, &offset); err != nil {
+			return nil, fmt.Errorf("failed to read shard, err=%w", err)
 		}
 	}
 	if len(handlers) == 0 {
@@ -248,21 +234,14 @@ func (k *kinesisConsumer) loadDependentHandler(ctx context.Context, shardConfig 
 	return out, nil
 }
 
-func (k *kinesisConsumer) readShard(ctx context.Context, shardConfig *shardConfiguration, shard string, handler MessageHandler, offset *string) (string, error) {
-	input := k.buildShardIteratorInput(shard, offset)
+func (k *kinesisConsumer) readShard(ctx context.Context, shard *shardMetadata, handler MessageHandler, offset *string) (string, error) {
+	input := k.buildShardIteratorInput(shard.id, offset)
 	it, err := k.kinesisClient.GetShardIterator(ctx, input)
 	if err != nil {
 		return "", fmt.Errorf("failed to get shard iterator, err=%w", err)
 	}
 	iter := it.ShardIterator
-	shardMetadata, ok := shardConfig.shards[shard]
-	if !ok {
-		return "", errors.New("shard does not exist")
-	}
-	if shardMetadata.SequenceNumberRange == nil || shardMetadata.SequenceNumberRange.StartingSequenceNumber == nil {
-		return "", errors.New("shard metadata has no start sequence number")
-	}
-	lastOffset := *shardMetadata.SequenceNumberRange.StartingSequenceNumber
+	lastOffset := shard.startOffset
 	if offset != nil {
 		lastOffset = *offset
 	}
@@ -291,18 +270,18 @@ func (k *kinesisConsumer) readShard(ctx context.Context, shardConfig *shardConfi
 	return lastOffset, nil
 }
 
-func (k *kinesisConsumer) buildShardIteratorInput(shard string, offset *string) *kinesis.GetShardIteratorInput {
+func (k *kinesisConsumer) buildShardIteratorInput(shardID string, offset *string) *kinesis.GetShardIteratorInput {
 	if offset != nil {
 		return &kinesis.GetShardIteratorInput{
 			StreamName:             aws.String(k.streamName),
-			ShardId:                aws.String(shard),
+			ShardId:                aws.String(shardID),
 			ShardIteratorType:      types.ShardIteratorTypeAfterSequenceNumber,
 			StartingSequenceNumber: aws.String(*offset),
 		}
 	}
 	return &kinesis.GetShardIteratorInput{
 		StreamName:        aws.String(k.streamName),
-		ShardId:           aws.String(shard),
+		ShardId:           aws.String(shardID),
 		ShardIteratorType: types.ShardIteratorTypeTrimHorizon,
 	}
 }

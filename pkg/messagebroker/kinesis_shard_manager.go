@@ -46,7 +46,7 @@ func NewKinesisShardManager(
 		hashRingPartitionExpiry: hashRingPartitionExpiry,
 		leaseDuration:           leaseDuration,
 
-		leasedShards: map[string]lock.Lock{},
+		leasedShardIDs: map[string]lock.Lock{},
 	}
 }
 
@@ -63,7 +63,7 @@ type kinesisShardManager struct {
 	hashRingPartitionExpiry time.Duration
 	leaseDuration           time.Duration
 
-	leasedShards map[string]lock.Lock
+	leasedShardIDs map[string]lock.Lock
 }
 
 type shardMetadata struct {
@@ -97,7 +97,7 @@ func (k *kinesisShardManager) leaseShards(ctx context.Context, shards []*shardMe
 	if err != nil {
 		return nil, fmt.Errorf("failed to load hash ring, err=%w", err)
 	}
-	hashRingPartitionExpires := k.clockClient.TimeFromNow(k.hashRingPartitionExpiry)
+	hashRingPartitionExpires := k.clockClient.FromNow(k.hashRingPartitionExpiry)
 	hashRing.AddWithExpiry(k.nodeID, hashRingPartitionExpires)
 	shardIDs := k.convertShardToShardID(shards)
 	leasedShardIDs, err := k.updateLease(ctx, shardIDs, hashRing)
@@ -121,33 +121,33 @@ func (k *kinesisShardManager) updateLease(ctx context.Context, shardIDs []string
 			leaseCandidates = append(leaseCandidates, shardIDs[i])
 		}
 	}
-	leasedShards := map[string]lock.Lock{}
-	for _, shard := range leaseCandidates {
-		if lock, ok := k.leasedShards[shard]; ok {
+	shardIDLocks := map[string]lock.Lock{}
+	for _, shardID := range leaseCandidates {
+		if lock, ok := k.leasedShardIDs[shardID]; ok {
 			err := lock.Extend(ctx, k.leaseDuration)
 			if err != nil {
 				continue
 			}
-			leasedShards[shard] = lock
+			shardIDLocks[shardID] = lock
 		}
-		shardLockKey := k.buildShardLockKey(shard)
+		shardLockKey := k.buildShardLockKey(shardID)
 		lock, err := k.lockClient.Acquire(ctx, shardLockKey, k.leaseDuration)
 		if err != nil {
 			continue
 		}
-		leasedShards[shard] = lock
+		shardIDLocks[shardID] = lock
 	}
-	for shard, lock := range k.leasedShards {
-		if _, ok := leasedShards[shard]; !ok {
+	for shardID, lock := range k.leasedShardIDs {
+		if _, ok := shardIDLocks[shardID]; !ok {
 			lock.Release(ctx)
 		}
 	}
-	k.leasedShards = leasedShards
-	leasedShardKeys := []string{}
-	for shard := range leasedShards {
-		leasedShardKeys = append(leasedShardKeys, shard)
+	k.leasedShardIDs = shardIDLocks
+	leasedShardIDs := []string{}
+	for shardID := range shardIDLocks {
+		leasedShardIDs = append(leasedShardIDs, shardID)
 	}
-	return leasedShardKeys, nil
+	return leasedShardIDs, nil
 }
 
 func (k *kinesisShardManager) convertShardToShardID(shards []*shardMetadata) []string {
@@ -270,7 +270,7 @@ func (k *kinesisShardManager) saveHashRing(ctx context.Context, hashRing *utils.
 	if err != nil {
 		return fmt.Errorf("failed to marshal hash ring, err=%w", err)
 	}
-	expiresAt := k.clockClient.TimeFromNow(k.hashRingExpiry)
+	expiresAt := k.clockClient.FromNow(k.hashRingExpiry)
 	if err := k.kvstoreClient.PutWithExpiry(ctx, hashRingKey, string(hashRingPayload), expiresAt); err != nil {
 		return fmt.Errorf("failed to put value, err=%w", err)
 	}
